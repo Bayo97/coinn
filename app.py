@@ -4,18 +4,24 @@ import json
 import logging
 import traceback
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import feedparser
 import requests
+from flask import Flask, request
 
 # Konfiguracja z ENV
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # np. -1001234567890
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 FEED_URL = "https://coinn.pl/feed/"
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 SEEN_FILE = Path("seen.json")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+app = Flask(__name__)
+
+auto_publish_enabled = True  # można wyłączyć komendą
 
 
 def load_seen():
@@ -59,10 +65,13 @@ def format_entry(entry):
     return msg
 
 
-def send_telegram_message(text):
+def send_telegram_message(text, chat_id=None):
+    if chat_id is None:
+        chat_id = TELEGRAM_CHAT_ID
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
@@ -74,24 +83,81 @@ def send_telegram_message(text):
         logging.error(f"Telegram API error: {e}")
 
 
+def get_entries_last_7_days():
+    feed = feedparser.parse(FEED_URL)
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    results = []
+
+    for entry in feed.entries:
+        published = entry.get("published_parsed")
+        if not published:
+            continue
+
+        dt = datetime(*published[:6])
+        if dt >= week_ago:
+            results.append(entry)
+
+    return results
+
+
+@app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
+def telegram_webhook():
+    global auto_publish_enabled
+
+    data = request.json
+    if not data:
+        return "no json", 200
+
+    message = data.get("message", {})
+    text = message.get("text", "")
+    chat_id = message.get("chat", {}).get("id")
+
+    if text == "/news":
+        send_telegram_message(
+            "<b>Dostępne opcje:</b>\n"
+            "/last7 — pokaż artykuły z ostatnich 7 dni\n"
+            "/auto_on — włącz auto-publikację\n"
+            "/auto_off — wyłącz auto-publikację",
+            chat_id
+        )
+
+    elif text == "/last7":
+        entries = get_entries_last_7_days()
+        if not entries:
+            send_telegram_message("Brak artykułów z ostatnich 7 dni", chat_id)
+        else:
+            for e in entries:
+                send_telegram_message(format_entry(e), chat_id)
+
+    elif text == "/auto_on":
+        auto_publish_enabled = True
+        send_telegram_message("Auto-publikacja włączona ✔️", chat_id)
+
+    elif text == "/auto_off":
+        auto_publish_enabled = False
+        send_telegram_message("Auto-publikacja wyłączona ❌", chat_id)
+
+    return "ok", 200
+
+
 def main_loop():
     seen = load_seen()
     logging.info(f"Wczytano {len(seen)} znanych wpisów.")
 
     while True:
         try:
-            feed = feedparser.parse(FEED_URL)
-            entries = feed.entries
+            if auto_publish_enabled:
+                feed = feedparser.parse(FEED_URL)
+                entries = feed.entries
 
-            for entry in reversed(entries):
-                eid = entry.get("id") or entry.get("link")
+                for entry in reversed(entries):
+                    eid = entry.get("id") or entry.get("link")
 
-                if eid not in seen:
-                    logging.info(f"Nowy artykuł: {entry.get('title')}")
-                    msg = format_entry(entry)
-                    send_telegram_message(msg)
-                    seen.add(eid)
-                    save_seen(seen)
+                    if eid not in seen:
+                        msg = format_entry(entry)
+                        send_telegram_message(msg)
+                        seen.add(eid)
+                        save_seen(seen)
 
         except Exception:
             logging.error(traceback.format_exc())
@@ -100,5 +166,10 @@ def main_loop():
 
 
 if __name__ == "__main__":
-    logging.info("Bot Coinn Telegram Bot startuje...")
-    main_loop()
+    # start webhook + worker
+    import threading
+    t = threading.Thread(target=main_loop)
+    t.daemon = True
+    t.start()
+
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 3000)))
